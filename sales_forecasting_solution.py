@@ -1,228 +1,534 @@
-#!/usr/bin/env python3
-# B2B Sales Forecasting Solution for Steel Manufacturing Company
+# B2B Sales Forecasting Solution
+# =============================
+
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-from sklearn.model_selection import cross_val_score, KFold
+from sklearn.linear_model import ElasticNet
+from sklearn.model_selection import cross_val_score, GroupKFold
 from sklearn.metrics import mean_absolute_error
-import matplotlib.pyplot as plt
-import seaborn as sns
+import xgboost as xgb
+import lightgbm as lgb
+from sklearn.model_selection import GridSearchCV
 
 # Set random seed for reproducibility
 np.random.seed(42)
 
-def load_data():
-    """Load and prepare the datasets"""
-    train = pd.read_csv('train.csv')
-    test = pd.read_csv('test.csv')
-    economic = pd.read_csv('EconomicIndicators.csv')
-    return train, test, economic
+# 1. Load the datasets
+train_df = pd.read_csv('train.csv')
+test_df = pd.read_csv('test.csv')
+economic_df = pd.read_csv('EconomicIndicators.csv')
 
-def map_quarter_to_months(quarter):
-    """Map quarter to corresponding months"""
-    quarter_num = int(quarter[1])
-    # Q1 corresponds to months 1-3, Q2 to 4-6, etc.
-    start_month = (quarter_num - 1) * 3 + 1
-    return list(range(start_month, start_month + 3))
+# 2. Data Exploration
+print("Train data shape:", train_df.shape)
+print("Test data shape:", test_df.shape)
+print("Economic indicators shape:", economic_df.shape)
 
-def preprocess_data(train, test, economic):
-    """Preprocess the data for modeling"""
-    # Map quarters to economic data
-    def add_economic_features(df):
-        df_copy = df.copy()
-        # Extract quarter number and create a feature
-        df_copy['quarter_num'] = df_copy['Quarter'].str[1].astype(int)
+# Display basic information about the datasets
+print("\nTrain data info:")
+print(train_df.info())
+print("\nSample of train data:")
+print(train_df.head())
+
+print("\nTest data info:")
+print(test_df.info())
+print("\nSample of test data:")
+print(test_df.head())
+
+print("\nEconomic indicators info:")
+print(economic_df.info())
+print("\nSample of economic indicators:")
+print(economic_df.head())
+
+# Check for missing values
+print("\nMissing values in train data:")
+print(train_df.isnull().sum())
+print("\nMissing values in test data:")
+print(test_df.isnull().sum())
+print("\nMissing values in economic indicators:")
+print(economic_df.isnull().sum())
+
+# 3. Feature Engineering
+
+# Extract quarter number from Quarter column
+def extract_quarter_num(quarter_str):
+    return int(quarter_str.replace('Q', ''))
+
+train_df['QuarterNum'] = train_df['Quarter'].apply(extract_quarter_num)
+test_df['QuarterNum'] = test_df['Quarter'].apply(extract_quarter_num)
+
+# Map Quarter to corresponding months
+quarter_to_months = {
+    'Q1': [1, 2, 3],
+    'Q2': [4, 5, 6],
+    'Q3': [7, 8, 9],
+    'Q4': [10, 11, 12],
+    'Q5': [13, 14, 15],
+    'Q6': [16, 17, 18],
+    'Q7': [19, 20, 21],
+    'Q8': [22, 23, 24],
+    'Q9': [25, 26, 27]
+}
+
+# Function to merge economic indicators with sales data
+def merge_economic_indicators(df, economic_df, quarter_to_months):
+    result_df = df.copy()
+    
+    # Create new columns for aggregated economic indicators
+    economic_features = ['Consumer Sentiment', 'Interest Rate', 'PMI', 
+                         'Money Supply', 'NationalEAI', 'EastEAI', 
+                         'WestEAI', 'SouthEAI', 'NorthEAI']
+    
+    for feature in economic_features:
+        result_df[f'Avg_{feature}'] = 0.0
+        result_df[f'Min_{feature}'] = 0.0
+        result_df[f'Max_{feature}'] = 0.0
+        result_df[f'Trend_{feature}'] = 0.0
+    
+    # Aggregate economic indicators for each quarter in each row
+    for _, row in result_df.iterrows():
+        quarter = row['Quarter']
+        months = quarter_to_months.get(quarter, [])
         
-        # Create mappings for each quarter to corresponding months
-        quarterly_eco_data = {}
-        for q in range(1, 10):  # Q1 to Q9
-            quarter = f"Q{q}"
-            months = map_quarter_to_months(quarter)
+        # Filter economic data for the corresponding months
+        quarter_economic = economic_df[economic_df['Month'].isin(months)]
+        
+        if not quarter_economic.empty:
+            for feature in economic_features:
+                result_df.loc[_, f'Avg_{feature}'] = quarter_economic[feature].mean()
+                result_df.loc[_, f'Min_{feature}'] = quarter_economic[feature].min()
+                result_df.loc[_, f'Max_{feature}'] = quarter_economic[feature].max()
+                
+                # Calculate trend (difference between last and first month in quarter)
+                if len(quarter_economic) > 1:
+                    first_month = quarter_economic.iloc[0][feature]
+                    last_month = quarter_economic.iloc[-1][feature]
+                    result_df.loc[_, f'Trend_{feature}'] = last_month - first_month
+    
+    # Add region-specific economic indicators
+    for _, row in result_df.iterrows():
+        region = row['Region']
+        if region == 'East':
+            result_df.loc[_, 'RegionalEAI'] = result_df.loc[_, 'Avg_EastEAI']
+        elif region == 'West':
+            result_df.loc[_, 'RegionalEAI'] = result_df.loc[_, 'Avg_WestEAI']
+        elif region == 'South':
+            result_df.loc[_, 'RegionalEAI'] = result_df.loc[_, 'Avg_SouthEAI']
+        elif region == 'North':
+            result_df.loc[_, 'RegionalEAI'] = result_df.loc[_, 'Avg_NorthEAI']
+    
+    return result_df
+
+# Apply economic indicators to both train and test data
+train_df = merge_economic_indicators(train_df, economic_df, quarter_to_months)
+test_df = merge_economic_indicators(test_df, economic_df, quarter_to_months)
+
+# Create lagged features for time series aspects
+# Group by company to create company-specific features
+def create_company_features(df):
+    result_df = df.copy()
+    
+    # Sort by company and quarter for proper lag creation
+    result_df = result_df.sort_values(['Company', 'QuarterNum'])
+    
+    # Initialize columns for lagged features
+    result_df['Sales_Lag1'] = np.nan
+    result_df['Sales_Lag2'] = np.nan
+    result_df['Sales_Lag3'] = np.nan
+    result_df['Sales_Growth_Rate'] = np.nan
+    result_df['Sales_Rolling_Mean'] = np.nan
+    result_df['Sales_Rolling_Std'] = np.nan
+    
+    # Calculate lagged features for each company
+    for company in df['Company'].unique():
+        company_mask = result_df['Company'] == company
+        company_data = result_df[company_mask].copy()
+        
+        if 'Sales' in company_data.columns:
+            # Create lag features
+            company_data['Sales_Lag1'] = company_data['Sales'].shift(1)
+            company_data['Sales_Lag2'] = company_data['Sales'].shift(2)
+            company_data['Sales_Lag3'] = company_data['Sales'].shift(3)
             
-            # Filter economic data for these months (only use months that exist in the data)
-            valid_months = [m for m in months if m <= len(economic)]
-            if valid_months:
-                # Average the economic indicators for the quarter
-                quarter_eco = economic[economic['Month'].isin(valid_months)].mean(numeric_only=True)
-                quarterly_eco_data[quarter] = quarter_eco
-        
-        # Add economic indicators as features
-        for quarter, eco_data in quarterly_eco_data.items():
-            mask = df_copy['Quarter'] == quarter
-            for col in economic.columns[1:]:  # Skip 'Month' column
-                df_copy.loc[mask, f'eco_{col}'] = eco_data[col]
-        
-        return df_copy
+            # Calculate growth rate
+            company_data['Sales_Growth_Rate'] = company_data['Sales'].pct_change()
+            
+            # Calculate rolling statistics
+            company_data['Sales_Rolling_Mean'] = company_data['Sales'].rolling(window=3, min_periods=1).mean()
+            company_data['Sales_Rolling_Std'] = company_data['Sales'].rolling(window=3, min_periods=1).std()
+            
+            # Update the main dataframe
+            result_df.loc[company_mask] = company_data
     
-    # Apply economic features to both train and test
-    train_processed = add_economic_features(train)
-    test_processed = add_economic_features(test)
-    
-    # Feature engineering
-    def engineer_features(df):
-        df_copy = df.copy()
-        
-        # Create lag features for companies (if possible)
-        companies = df_copy['Company'].unique()
-        
-        # Fill missing values in economic features
-        eco_cols = [col for col in df_copy.columns if col.startswith('eco_')]
-        df_copy[eco_cols] = df_copy[eco_cols].fillna(df_copy[eco_cols].mean())
-        
-        # Encode categorical variables
-        df_copy['Bond_rating_encoded'] = df_copy['Bond rating'].map({
-            'AAA': 7, 'AA': 6, 'A': 5, 'BBB': 4, 'BB': 3, 'B': 2, 'CCC': 1
-        })
-        
-        df_copy['Stock_rating_encoded'] = df_copy['Stock rating'].map({
-            'Buy': 3, 'Hold': 2, 'Sell': 1
-        })
-        
-        return df_copy
-    
-    train_processed = engineer_features(train_processed)
-    test_processed = engineer_features(test_processed)
-    
-    return train_processed, test_processed
+    return result_df
 
-def build_model(train_processed):
-    """Build and train the forecasting model"""
-    # Prepare features and target
-    X = train_processed.drop(['Sales', 'Quarter', 'Company', 'Bond rating', 'Stock rating', 'Region', 'Industry'], axis=1)
-    y = train_processed['Sales']
+# Apply company features to train data
+train_df = create_company_features(train_df)
+
+# Create additional features based on the bond and stock ratings
+def process_ratings(df):
+    result_df = df.copy()
     
-    # Define categorical and numerical features
+    # Convert bond ratings to numeric scores
+    bond_mapping = {
+        'AAA': 10, 'AA+': 9.5, 'AA': 9, 'AA-': 8.5,
+        'A+': 8, 'A': 7.5, 'A-': 7, 'BBB+': 6.5,
+        'BBB': 6, 'BBB-': 5.5, 'BB+': 5, 'BB': 4.5,
+        'BB-': 4, 'B+': 3.5, 'B': 3, 'B-': 2.5,
+        'CCC+': 2, 'CCC': 1.5, 'CCC-': 1, 'D': 0.5
+    }
+    
+    result_df['BondScore'] = result_df['Bond rating'].map(bond_mapping)
+    
+    # Convert stock ratings to numeric scores
+    stock_mapping = {
+        'Strong Buy': 5, 'Buy': 4, 'Hold': 3, 'Sell': 2, 'Strong Sell': 1
+    }
+    
+    result_df['StockScore'] = result_df['Stock rating'].map(stock_mapping)
+    
+    # Create a combined rating score
+    result_df['CombinedScore'] = result_df['BondScore'] * result_df['StockScore']
+    
+    return result_df
+
+# Apply rating processing to both train and test data
+train_df = process_ratings(train_df)
+test_df = process_ratings(test_df)
+
+# 4. Feature Selection and Data Preparation
+
+# Fill missing values in lag features with appropriate values (medians by company)
+def fill_missing_values(df):
+    result_df = df.copy()
+    
+    # Fill missing lag values with company medians where available
+    for company in result_df['Company'].unique():
+        company_mask = result_df['Company'] == company
+        for col in ['Sales_Lag1', 'Sales_Lag2', 'Sales_Lag3', 'Sales_Growth_Rate', 'Sales_Rolling_Mean', 'Sales_Rolling_Std']:
+            if col in result_df.columns:
+                median_val = result_df.loc[company_mask, col].median()
+                if not pd.isna(median_val):
+                    result_df.loc[company_mask, col] = result_df.loc[company_mask, col].fillna(median_val)
+    
+    # Fill any remaining missing values with global medians
+    for col in result_df.columns:
+        if result_df[col].isna().sum() > 0:
+            median_val = result_df[col].median()
+            if not pd.isna(median_val):
+                result_df[col] = result_df[col].fillna(median_val)
+            else:
+                # If median is still NaN, fill with 0
+                result_df[col] = result_df[col].fillna(0)
+    
+    return result_df
+
+# Apply missing value filling to train data
+train_df = fill_missing_values(train_df)
+
+# For test data, we need to handle the lack of lag features
+# Fill test lag features with the most recent values from train
+def prepare_test_lag_features(train_df, test_df):
+    test_with_lags = test_df.copy()
+    
+    # For each company in test, find the most recent values from train
+    for company in test_with_lags['Company'].unique():
+        # Get data for this company from train
+        company_train = train_df[train_df['Company'] == company].sort_values('QuarterNum', ascending=False)
+        
+        if len(company_train) > 0:
+            # Get the most recent data point
+            latest_data = company_train.iloc[0]
+            
+            # For each test row of this company, fill in the lag values
+            company_mask = test_with_lags['Company'] == company
+            
+            # Initialize lag columns in test data if they don't exist
+            for lag_col in ['Sales_Lag1', 'Sales_Lag2', 'Sales_Lag3', 'Sales_Growth_Rate', 'Sales_Rolling_Mean', 'Sales_Rolling_Std']:
+                if lag_col not in test_with_lags.columns:
+                    test_with_lags[lag_col] = np.nan
+                    
+                if lag_col in company_train.columns:
+                    if 'Lag' in lag_col:
+                        shift_amount = int(lag_col.split('_Lag')[1])
+                        
+                        # If we have enough history, use the appropriate lag
+                        if len(company_train) >= shift_amount:
+                            lag_value = company_train.iloc[shift_amount-1]['Sales'] if shift_amount <= len(company_train) else 0
+                            test_with_lags.loc[company_mask, lag_col] = lag_value
+                        else:
+                            # Not enough history, use the median sales for this company
+                            test_with_lags.loc[company_mask, lag_col] = company_train['Sales'].median()
+                    else:
+                        # For other derived features, use the latest value
+                        test_with_lags.loc[company_mask, lag_col] = latest_data.get(lag_col, 0)
+    
+    return test_with_lags
+
+# Define features and target
+def prepare_features(train_df, test_df):
+    # Define which features to use
+    numeric_features = [
+        'QuickRatio', 'InventoryRatio', 'RevenueGrowth', 'Marketshare',
+        'QuarterNum', 'BondScore', 'StockScore', 'CombinedScore', 
+        'Avg_Consumer Sentiment', 'Avg_Interest Rate', 'Avg_PMI', 
+        'Avg_Money Supply', 'Avg_NationalEAI', 'RegionalEAI',
+        'Trend_Interest Rate', 'Trend_PMI', 'Trend_NationalEAI'
+    ]
+    
+    # Add lag features
+    lag_features = [
+        'Sales_Lag1', 'Sales_Lag2', 'Sales_Lag3', 
+        'Sales_Growth_Rate', 'Sales_Rolling_Mean', 'Sales_Rolling_Std'
+    ]
+    
+    # Make sure these features exist in both dataframes
+    for feature in lag_features:
+        if feature in train_df.columns:
+            if feature not in test_df.columns:
+                test_df[feature] = 0  # Initialize with zeros if not present
+            numeric_features.append(feature)
+    
     categorical_features = ['Region', 'Industry']
-    numerical_features = [col for col in X.columns if col not in categorical_features]
     
-    print(f"Training with {len(numerical_features)} numerical features")
+    # Prepare X_train, y_train
+    X_train = train_df[numeric_features + categorical_features]
+    y_train = train_df['Sales']
     
-    # Create preprocessing pipelines
-    categorical_transformer = Pipeline(steps=[
-        ('onehot', OneHotEncoder(handle_unknown='ignore'))
+    # Prepare X_test
+    X_test = test_df[numeric_features + categorical_features]
+    
+    return X_train, y_train, X_test, numeric_features, categorical_features
+
+# Prepare test data with lag features BEFORE calling prepare_features
+test_with_lags = prepare_test_lag_features(train_df, test_df)
+
+# Now prepare features using test_with_lags instead of test_df
+X_train, y_train, X_test, numeric_features, categorical_features = prepare_features(train_df, test_with_lags)
+
+# Check for missing values in prepared data
+print("\nMissing values in X_train:")
+print(X_train.isnull().sum())
+print("\nMissing values in X_test:")
+print(X_test.isnull().sum())
+
+# Handle any remaining missing values
+X_train = pd.DataFrame(X_train).fillna(0)
+X_test = pd.DataFrame(X_test).fillna(0)
+
+# 5. Model Building and Evaluation
+
+# Create a preprocessor with scaling for numeric features and one-hot encoding for categorical features
+preprocessor = ColumnTransformer(
+    transformers=[
+        ('num', StandardScaler(), numeric_features),
+        ('cat', OneHotEncoder(handle_unknown='ignore'), categorical_features)
+    ]
+)
+
+# Define various models to try
+models = {
+    'RandomForest': RandomForestRegressor(random_state=42),
+    'GradientBoosting': GradientBoostingRegressor(random_state=42),
+    'ElasticNet': ElasticNet(random_state=42),
+    'XGBoost': xgb.XGBRegressor(random_state=42),
+    'LightGBM': lgb.LGBMRegressor(random_state=42)
+}
+
+# Cross-validation strategy (use GroupKFold to prevent data leakage between companies)
+cv = GroupKFold(n_splits=5)
+groups = train_df['Company']  # Group by company
+
+# Evaluate models
+model_scores = {}
+for name, model in models.items():
+    # Create pipeline
+    pipeline = Pipeline([
+        ('preprocessor', preprocessor),
+        ('model', model)
     ])
     
-    numerical_transformer = Pipeline(steps=[
-        ('scaler', StandardScaler())
-    ])
-    
-    # Combine preprocessing steps
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ('cat', categorical_transformer, categorical_features),
-            ('num', numerical_transformer, numerical_features)
-        ])
-    
-    # Replace XGBoost with RandomForest which has better compatibility
-    model = RandomForestRegressor(
-        n_estimators=200,
-        max_depth=10,
-        min_samples_split=5,
-        min_samples_leaf=2,
-        random_state=42,
-        n_jobs=-1
+    # Perform cross-validation
+    scores = cross_val_score(
+        pipeline, X_train, y_train, 
+        cv=cv, scoring='neg_mean_absolute_error', 
+        groups=groups
     )
     
-    # Manual cross-validation to avoid compatibility issues
-    from sklearn.model_selection import KFold
-    kf = KFold(n_splits=5, shuffle=True, random_state=42)
-    mae_scores = []
+    # Store the absolute value of the mean score (since MAE is negative)
+    model_scores[name] = -scores.mean()
     
-    print("Performing cross-validation...")
-    for train_idx, valid_idx in kf.split(X):
-        X_train, X_valid = X.iloc[train_idx], X.iloc[valid_idx]
-        y_train, y_valid = y.iloc[train_idx], y.iloc[valid_idx]
+    print(f"{name} CV MAE: {-scores.mean():.2f} (± {scores.std():.2f})")
+
+# Select the best model based on cross-validation
+best_model_name = min(model_scores, key=model_scores.get)
+print(f"\nBest model: {best_model_name} with MAE: {model_scores[best_model_name]:.2f}")
+
+# Fine-tune the best model using GridSearchCV
+if best_model_name == 'RandomForest':
+    param_grid = {
+        'model__n_estimators': [100, 200, 300],
+        'model__max_depth': [None, 10, 20, 30],
+        'model__min_samples_split': [2, 5, 10]
+    }
+elif best_model_name == 'GradientBoosting':
+    param_grid = {
+        'model__n_estimators': [100, 200, 300],
+        'model__learning_rate': [0.01, 0.05, 0.1],
+        'model__max_depth': [3, 5, 7]
+    }
+elif best_model_name == 'XGBoost':
+    param_grid = {
+        'model__n_estimators': [100, 200, 300],
+        'model__learning_rate': [0.01, 0.05, 0.1],
+        'model__max_depth': [3, 5, 7],
+        'model__subsample': [0.8, 0.9, 1.0]
+    }
+elif best_model_name == 'LightGBM':
+    param_grid = {
+        'model__n_estimators': [100, 200, 300],
+        'model__learning_rate': [0.01, 0.05, 0.1],
+        'model__num_leaves': [31, 63, 127]
+    }
+else:  # ElasticNet
+    param_grid = {
+        'model__alpha': [0.1, 0.5, 1.0],
+        'model__l1_ratio': [0.1, 0.5, 0.9]
+    }
+
+# Create pipeline with best model
+best_pipeline = Pipeline([
+    ('preprocessor', preprocessor),
+    ('model', models[best_model_name])
+])
+
+# Perform grid search
+grid_search = GridSearchCV(
+    best_pipeline,
+    param_grid=param_grid,
+    cv=cv,
+    scoring='neg_mean_absolute_error',
+    n_jobs=-1,
+    verbose=1
+)
+
+grid_search.fit(X_train, y_train, groups=groups)
+
+# Get the best parameters and score
+best_params = grid_search.best_params_
+best_score = -grid_search.best_score_  # Convert back to positive MAE
+print(f"\nBest parameters: {best_params}")
+print(f"Best cross-validation MAE: {best_score:.2f}")
+
+# 6. Ensemble Modeling (Stacking)
+from sklearn.ensemble import StackingRegressor
+
+# Get the top 3 models based on CV scores
+top_models = sorted(model_scores.items(), key=lambda x: x[1])[:3]
+top_model_names = [model[0] for model in top_models]
+print(f"\nTop 3 models for stacking: {top_model_names}")
+
+# Create base estimators from the top models
+base_estimators = []
+for name in top_model_names:
+    base_estimators.append((name, Pipeline([
+        ('preprocessor', preprocessor),
+        ('model', models[name])
+    ])))
+
+# Define the final estimator
+final_estimator = models[best_model_name]
+
+# Create the stacking regressor
+stacking_regressor = StackingRegressor(
+    estimators=base_estimators,
+    final_estimator=final_estimator,
+    cv=cv
+)
+
+# Train the stacking regressor
+stacking_regressor.fit(X_train, y_train)
+
+# 7. Generate Predictions and Create Submission File
+
+# Train the best model on the full training data
+best_model = grid_search.best_estimator_
+best_model.fit(X_train, y_train)
+
+# Handle missing values
+X_test_final = pd.DataFrame(X_test).fillna(0)
+
+# Make predictions with best model and stacking ensemble
+best_predictions = best_model.predict(X_test_final)
+stacking_predictions = stacking_regressor.predict(X_test_final)
+
+# Average the predictions (ensemble of ensembles)
+final_predictions = (best_predictions + stacking_predictions) / 2
+
+# Create submission file
+submission = pd.DataFrame({
+    'ID': test_df['RowID'],
+    'Sales': final_predictions
+})
+
+# Ensure predictions are non-negative
+submission['Sales'] = submission['Sales'].clip(lower=0)
+
+# Save to CSV
+submission.to_csv('submission.csv', index=False)
+print("\nSubmission file created.")
+
+# 8. Feature Importance Analysis
+def plot_feature_importance(model, feature_names):
+    if hasattr(model, 'feature_importances_'):
+        # For tree-based models
+        importances = model.feature_importances_
+        indices = np.argsort(importances)[::-1]
         
-        model.fit(X_train, y_train)
-        y_pred = model.predict(X_valid)
-        mae = mean_absolute_error(y_valid, y_pred)
-        mae_scores.append(mae)
-    
-    print(f"Cross-validation MAE: {np.mean(mae_scores):.2f} ± {np.std(mae_scores):.2f}")
-    
-    # Train on full dataset
-    print("Training final model on full dataset...")
-    model.fit(X, y)
-    
-    return model, X.columns
+        plt.figure(figsize=(12, 8))
+        plt.title('Feature Importances')
+        plt.bar(range(len(indices)), importances[indices], align='center')
+        plt.xticks(range(len(indices)), [feature_names[i] for i in indices], rotation=90)
+        plt.tight_layout()
+        plt.show()
+    elif hasattr(model, 'coef_'):
+        # For linear models
+        importances = np.abs(model.coef_)
+        indices = np.argsort(importances)[::-1]
+        
+        plt.figure(figsize=(12, 8))
+        plt.title('Feature Importances')
+        plt.bar(range(len(indices)), importances[indices], align='center')
+        plt.xticks(range(len(indices)), [feature_names[i] for i in indices], rotation=90)
+        plt.tight_layout()
+        plt.show()
+    else:
+        print("Model doesn't have feature_importances_ or coef_ attribute")
 
-def make_predictions(model, feature_cols, train_processed, test_processed):
-    """Make predictions on the test data"""
-    # Prepare test features
-    X_test = test_processed[feature_cols]
+# Try to extract the actual model from the pipeline
+try:
+    # Get the list of feature names after preprocessing
+    preprocessed_features = []
+    for name, transformer, features in preprocessor.transformers_:
+        if name == 'num':
+            preprocessed_features.extend(features)
+        elif name == 'cat':
+            # For categorical features, get the one-hot encoded feature names
+            for feature in features:
+                categories = list(transformer.categories_[features.index(feature)])
+                preprocessed_features.extend([f"{feature}_{category}" for category in categories])
     
-    # Make predictions
-    predictions = model.predict(X_test)
+    # Extract the model from the pipeline
+    model = best_model.named_steps['model']
     
-    # Create submission dataframe
-    submission = pd.DataFrame({
-        'ID': test_processed['RowID'],
-        'Sales': predictions
-    })
-    
-    return submission
+    # Plot feature importance
+    plot_feature_importance(model, preprocessed_features)
+except Exception as e:
+    print(f"Could not plot feature importance: {e}")
 
-def evaluate_and_visualize(train_processed, model, feature_cols):
-    """Evaluate model performance and visualize important features"""
-    # Prepare features and target
-    X = train_processed[feature_cols]
-    y = train_processed['Sales']
-    
-    # Make predictions on training data
-    y_pred = model.predict(X)
-    
-    # Calculate MAE
-    mae = mean_absolute_error(y, y_pred)
-    print(f"Training MAE: {mae:.2f}")
-    
-    # Visualize actual vs predicted
-    plt.figure(figsize=(10, 6))
-    plt.scatter(y, y_pred, alpha=0.5)
-    plt.plot([y.min(), y.max()], [y.min(), y.max()], 'r--')
-    plt.xlabel('Actual Sales')
-    plt.ylabel('Predicted Sales')
-    plt.title('Actual vs Predicted Sales')
-    plt.savefig('actual_vs_predicted.png')
-    
-    # Visualize feature importance
-    feature_importance = pd.DataFrame({
-        'Feature': feature_cols,
-        'Importance': model.feature_importances_
-    }).sort_values(by='Importance', ascending=False)
-    
-    plt.figure(figsize=(12, 8))
-    sns.barplot(x='Importance', y='Feature', data=feature_importance.head(15))
-    plt.title('Feature Importance')
-    plt.tight_layout()
-    plt.savefig('feature_importance.png')
-    
-    return feature_importance
-
-def main():
-    """Main execution function"""
-    print("Loading data...")
-    train, test, economic = load_data()
-    
-    print("Preprocessing data...")
-    train_processed, test_processed = preprocess_data(train, test, economic)
-    
-    print("Building and training model...")
-    model, feature_cols = build_model(train_processed)
-    
-    print("Evaluating model...")
-    feature_importance = evaluate_and_visualize(train_processed, model, feature_cols)
-    print("\nTop 10 most important features:")
-    print(feature_importance.head(10))
-    
-    print("\nMaking predictions on test data...")
-    submission = make_predictions(model, feature_cols, train_processed, test_processed)
-    
-    print("Saving submission file...")
-    submission.to_csv('submission.csv', index=False)
-    print("Done!")
-
-if __name__ == "__main__":
-    main()
+print("\nB2B Sales Forecasting project completed successfully!")
